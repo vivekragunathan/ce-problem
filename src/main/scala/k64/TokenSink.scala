@@ -1,11 +1,11 @@
 package k64
 
-import cats.effect.implicits.*
+import cats.Applicative
+import cats.effect.implicits._
 import cats.effect.kernel.{Async, Fiber}
 import cats.effect.std.Queue
 import cats.effect.{Resource, Sync}
-import cats.implicits.*
-import cats.syntax.option.catsSyntaxOptionId
+import cats.implicits._
 
 import scala.concurrent.duration.FiniteDuration
 
@@ -13,43 +13,52 @@ final case class Token(value: String) extends AnyVal
 final case class Tokenized(token: Token, value: String)
 
 trait TokenSink[F[_]] {
-
-  /**
-    * Publishes a token along with a corresponding raw value. Does not provide any guarantees about the
-    * publishing order.
-    *
-    * @param token token
-    * @param value raw value a token was created for
-    */
   def publish(token: Token, value: String): F[Unit]
-
-  /**
-    * Closes a token sink and releases resources (if any) allocated for it.
-    *
-    * @return
-    */
   def release: F[Unit]
 }
 
 object TokenSink {
-  def apply[F[_]](
+
+  implicit final class QueueOps[F[_]: Async, A](queue: Queue[F, A]) {
+    def takeN(n: Int): F[List[A]] = {
+      def loop(acc: List[A]): F[List[A]] =
+        if (acc.size >= n) Applicative[F].pure(acc)
+        else queue.take.flatMap(element => loop(acc :+ element))
+
+      loop(List.empty[A])
+    }
+
+    def takeN(n: Int, timeout: FiniteDuration): F[List[A]] =
+      Async[F]
+        .race(Async[F].sleep(timeout), takeN(n))
+        .flatMap {
+          case Left(_) =>
+            queue.tryTakeN(Some(n)) // Timeout case
+          case Right(result) =>
+            Applicative[F].pure(result) // takeN completed
+        }
+  }
+
+  def apply[F[_]: Async](
     batchSize: Int,
     lingerTimeout: FiniteDuration,
     tokenSink: Resource[F, Set[Tokenized] => F[Unit]]
-  )(implicit G: Async[F]): F[TokenSink[F]] = {
-    def flush(source: Queue[F, Tokenized], sink: Set[Tokenized] => F[Unit]): F[Unit] =
+  ): F[TokenSink[F]] = {
+    def flush[A](source: Queue[F, A], sink: Set[A] => F[Unit]): F[Unit] =
       source
         .tryTakeN(None)
-        .flatMap(_.grouped(batchSize).map(_.toSet).toList.traverse_(sink))
+        .flatMap { items =>
+          println("**** Flushing elements from buffer ...")
+          items.grouped(batchSize).map(_.toSet).toList.traverse_(sink)
+        }
 
-    def pollLoop(
-      source: Queue[F, Tokenized],
-      sink: Set[Tokenized] => F[Unit]
+    def pollLoop[A](
+      source: Queue[F, A],
+      sink: Set[A] => F[Unit]
     ): F[Fiber[F, Throwable, Unit]] =
       source
-        .tryTakeN(batchSize.some)
-        .timeoutTo(lingerTimeout, source.tryTakeN(batchSize.some))
-        .iterateUntil(ts => ts.nonEmpty)
+        .takeN(batchSize, lingerTimeout)
+        .iterateUntil(_.nonEmpty)
         .map(_.toSet)
         .flatMap(sink)
         .foreverM[Unit]
@@ -58,16 +67,16 @@ object TokenSink {
 
     for {
       _ <- batchSize.pure[F].ensure(new IllegalArgumentException(s"Max batch size must be > 0, was $batchSize"))(_ > 0)
-      buffer <- Queue.unbounded[F, Tokenized]
+      buffer <- Queue.bounded[F, Tokenized](batchSize * 2)
       loop <- tokenSink.use { sink =>
-        // No error propagation, no cancellation (to be sure a token taken from a query is published)
-        val safeSink: Set[Tokenized] => F[Unit] =
-          tokens =>
+        pollLoop(
+          buffer,
+          (tokens: Set[Tokenized]) =>
+            // No error propagation, no cancellation (to be sure a token taken from a query is published)
             sink(tokens)
               .handleErrorWith(t => logSinkError(tokens.map(_.token))(t))
               .uncancelable
-
-        pollLoop(buffer, safeSink)
+        )
       }
     } yield {
       new TokenSink[F] {
@@ -76,7 +85,8 @@ object TokenSink {
           buffer.offer(t).handleErrorWith(_ => logOverflow(t.token))
         }
 
-        override val release: F[Unit] = loop.cancel
+        override val release: F[Unit] =
+          loop.cancel.map(_ => println("Token sink released"))
       }
     }
   }
