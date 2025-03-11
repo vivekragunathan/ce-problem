@@ -1,12 +1,10 @@
-package k64
-
 import cats.effect.unsafe.implicits.global
 import cats.effect.{IO, IOApp, Resource}
 import cats.implicits._
 
-import scala.concurrent.duration.{DurationInt, FiniteDuration}
+import scala.concurrent.duration.DurationInt
 
-object App extends IOApp.Simple {
+object TokenSinkApp extends IOApp.Simple {
   override def run: IO[Unit] = {
 
     val res: Resource[IO, Set[Tokenized] => IO[Unit]] =
@@ -18,16 +16,8 @@ object App extends IOApp.Simple {
     publishTokens(tokenSink) *> tokenSink.release
   }
 
-  private def publishTokens2(tokenSink: TokenSink[IO]): IO[Unit] = IO {
-    for (i <- 1 to 100) {
-      tokenSink
-        .publish(Token(i.toString), i.toString)
-        .unsafeRunSync()
-    }
-  }
-
   private def publishTokens(tokenSink: TokenSink[IO]): IO[Unit] =
-    loopWithDelay(20, 1.second) { i =>
+    loopWithDelay(20, 2.seconds) { i =>
       println(s"Publishing token $i ...")
       tokenSink
         .publish(Token(i.toString), i.toString)
@@ -38,14 +28,4 @@ object App extends IOApp.Simple {
     println(s"Read ${tokens.size} elements from buffer ...")
     IO.println(tokens.mkString(">>>", ",", ""))
   }
-
-  private def loopWithDelay(n: Int, delay: FiniteDuration)(fn: Int => Unit): IO[Unit] =
-    if (n <= 0) IO.unit
-    else {
-      fn(n)
-      for {
-        _ <- IO.sleep(delay)
-        _ <- loopWithDelay(n - 1, delay)(fn)
-      } yield ()
-    }
 }

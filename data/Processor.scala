@@ -1,5 +1,3 @@
-package k64
-
 import cats.Applicative
 import cats.effect.implicits._
 import cats.effect.kernel.{Async, Fiber}
@@ -9,15 +7,12 @@ import cats.implicits._
 
 import scala.concurrent.duration.FiniteDuration
 
-final case class Token(value: String) extends AnyVal
-final case class Tokenized(token: Token, value: String)
-
-trait TokenSink[F[_]] {
-  def publish(token: Token, value: String): F[Unit]
+trait BufferRes2[F[_], A] {
+  def publish(item: A): F[Unit]
   def release: F[Unit]
 }
 
-object TokenSink {
+object BufferRes2 {
 
   implicit final class QueueOps[F[_]: Async, A](queue: Queue[F, A]) {
     def takeN(n: Int): F[List[A]] = {
@@ -39,16 +34,16 @@ object TokenSink {
         }
   }
 
-  def apply[F[_]: Async](
+  def apply[F[_]: Async, A](
     batchSize: Int,
     lingerTimeout: FiniteDuration,
-    tokenSink: Resource[F, Set[Tokenized] => F[Unit]]
-  ): F[TokenSink[F]] = {
+    tokenSink: Resource[F, Set[A] => F[Unit]]
+  ): F[BufferRes[F, A]] = {
     def flush[A](source: Queue[F, A], sink: Set[A] => F[Unit]): F[Unit] =
       source
         .tryTakeN(None)
         .flatMap { items =>
-          println("**** Flushing elements from buffer ...")
+          println(s"**** Flushing ${items.size} elements from buffer ...")
           items.grouped(batchSize).map(_.toSet).toList.traverse_(sink)
         }
 
@@ -57,7 +52,9 @@ object TokenSink {
       sink: Set[A] => F[Unit]
     ): F[Fiber[F, Throwable, Unit]] =
       source
-        .takeN(batchSize, lingerTimeout)
+        .takeN(batchSize)
+        .timeoutTo(lingerTimeout, source.tryTakeN(batchSize.some))
+        // .takeN(batchSize, lingerTimeout)
         .iterateUntil(_.nonEmpty)
         .map(_.toSet)
         .flatMap(sink)
@@ -67,23 +64,21 @@ object TokenSink {
 
     for {
       _ <- batchSize.pure[F].ensure(new IllegalArgumentException(s"Max batch size must be > 0, was $batchSize"))(_ > 0)
-      buffer <- Queue.bounded[F, Tokenized](batchSize * 2)
+      buffer <- Queue.bounded[F, A](batchSize * 2)
       loop <- tokenSink.use { sink =>
         pollLoop(
           buffer,
-          (tokens: Set[Tokenized]) =>
+          (items: Set[A]) =>
             // No error propagation, no cancellation (to be sure a token taken from a query is published)
-            sink(tokens)
-              .handleErrorWith(t => logSinkError(tokens.map(_.token))(t))
+            sink(items)
+              .handleErrorWith(logSinkError(items))
               .uncancelable
         )
       }
     } yield {
-      new TokenSink[F] {
-        override def publish(token: Token, value: String): F[Unit] = {
-          val t = Tokenized(token, value)
-          buffer.offer(t).handleErrorWith(_ => logOverflow(t.token))
-        }
+      new BufferRes2[F, A] {
+        override def publish(item: A): F[Unit] =
+          buffer.offer(item).ifM(Applicative[F].unit, logOverflow(item))
 
         override val release: F[Unit] =
           loop.cancel.map(_ => println("Token sink released"))
